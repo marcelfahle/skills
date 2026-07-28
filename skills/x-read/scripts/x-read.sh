@@ -367,23 +367,27 @@ cmd_tweet_xquik() {
 cmd_tweets_xquik() {
   local ids=${1:-}
   [ -n "$ids" ] || die "usage: x-read.sh tweets <id1,id2,...>  (max 100)"
-  local actor_input
-  actor_input=$(jq -cn --arg ids "$ids" '
-    ($ids | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $tweet_ids
-    | if ($tweet_ids | length) < 1
-        or ($tweet_ids | length) > 100
-        or any($tweet_ids[]; test("^[0-9]+$") | not)
-      then error("tweets needs 1 to 100 comma-separated numeric IDs")
-      else {
-        mode: "tweets",
-        tweetIds: $tweet_ids,
-        maxItems: ($tweet_ids | length),
-        outputVariant: "rich",
-        fieldStyle: "camelCase",
-        outputPreset: "nested"
-      }
-      end
-  ') || die "tweets needs 1 to 100 comma-separated numeric IDs" 2
+  local max=${MAX_RESULTS:-100}
+  local tweet_ids id_count actor_input
+  tweet_ids=$(jq -cn --arg ids "$ids" \
+    '$ids | split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+  jq -e '
+    length >= 1
+    and length <= 100
+    and all(.[]; test("^[0-9]+$"))
+  ' <<<"$tweet_ids" >/dev/null \
+    || die "tweets needs 1 to 100 comma-separated numeric IDs" 2
+  id_count=$(jq 'length' <<<"$tweet_ids")
+  [ "$id_count" -le "$max" ] \
+    || die "tweets has more IDs than --max allows" 2
+  actor_input=$(jq -cn --argjson tweet_ids "$tweet_ids" '{
+    mode: "tweets",
+    tweetIds: $tweet_ids,
+    maxItems: ($tweet_ids | length),
+    outputVariant: "rich",
+    fieldStyle: "camelCase",
+    outputPreset: "nested"
+  }')
   apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
 }
 
@@ -391,7 +395,7 @@ cmd_timeline_xquik() {
   local handle=${1:-}
   [ -n "$handle" ] || die "usage: x-read.sh timeline <username>"
   handle=${handle#@}
-  [[ $handle =~ ^[A-Za-z0-9_]{1,15}$ ]] \
+  [[ ! $handle =~ ^[0-9]+$ && $handle =~ ^[A-Za-z0-9_]{1,15}$ ]] \
     || die "Xquik timeline needs an X handle, not a numeric user ID or URL" 2
   local max=${MAX_RESULTS:-10}
   local actor_input

@@ -45,12 +45,28 @@ jq -e '
   and .input.maxItems == 2
 ' <<<"$tweets_plan" >/dev/null
 
+set +e
+run_plan tweets 123,456 --max 1 \
+  >"$TEMP_DIR/tweets-cap-output" 2>"$TEMP_DIR/tweets-cap-error"
+tweets_cap_status=$?
+set -e
+[ "$tweets_cap_status" -eq 2 ]
+grep -Fq 'tweets has more IDs than --max allows' "$TEMP_DIR/tweets-cap-error"
+
 timeline_plan=$(run_plan timeline @nasa --max 7)
 jq -e '
   .input.mode == "profileTweets"
   and .input.twitterHandles == ["nasa"]
   and .input.maxItems == 7
 ' <<<"$timeline_plan" >/dev/null
+
+set +e
+run_plan timeline 44196397 --max 7 \
+  >"$TEMP_DIR/numeric-timeline-output" 2>"$TEMP_DIR/numeric-timeline-error"
+numeric_timeline_status=$?
+set -e
+[ "$numeric_timeline_status" -eq 2 ]
+grep -Fq 'not a numeric user ID or URL' "$TEMP_DIR/numeric-timeline-error"
 
 search_plan=$(run_plan search "open source agents" --max 8)
 jq -e '
