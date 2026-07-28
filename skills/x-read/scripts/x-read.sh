@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# x-read — read-only client for X (Twitter) API v2.
+# x-read - read-only client for the X API and optional Xquik Apify Actors.
 # Usage: x-read.sh <subcommand> [args...]
 # Requires: curl, jq. Env: X_BEARER_TOKEN (required for most), X_USER_OAUTH_TOKEN (bookmarks),
-# X_USER_ID (optional convenience for "my" reads).
+# X_USER_ID (optional convenience for "my" reads), APIFY_TOKEN (approved Actor runs).
 
 set -euo pipefail
 
 API="https://api.x.com/2"
+APIFY_API="https://api.apify.com/v2"
+XQUIK_TWEET_ACTOR="xquik~x-tweet-scraper"
+XQUIK_FOLLOWER_ACTOR="xquik~x-follower-scraper"
+XQUIK_TWEET_URL="https://apify.com/xquik/x-tweet-scraper"
+XQUIK_FOLLOWER_URL="https://apify.com/xquik/x-follower-scraper"
 TWEET_FIELDS="id,text,author_id,created_at,conversation_id,referenced_tweets,public_metrics,lang,entities"
 USER_FIELDS="id,name,username,verified,public_metrics"
 EXPANSIONS="author_id,referenced_tweets.id,referenced_tweets.id.author_id,attachments.media_keys"
@@ -14,6 +19,11 @@ MEDIA_FIELDS="media_key,type,url,preview_image_url,alt_text"
 
 PRETTY=0
 MAX_RESULTS=""
+SOURCE="api"
+PLAN_ONLY=0
+PAID_RUN_APPROVED=0
+MAX_TOTAL_CHARGE_USD=""
+FOLLOWER_RELATION="followers"
 
 die() { printf 'x-read: %s\n' "$1" >&2; exit "${2:-1}"; }
 
@@ -26,6 +36,83 @@ require_token() {
 
 require_bin() {
   command -v "$1" >/dev/null 2>&1 || die "$1 not found on PATH" 2
+}
+
+print_json() {
+  if [ "$PRETTY" -eq 1 ]; then
+    jq .
+  else
+    jq -c .
+  fi
+}
+
+validate_positive_number() {
+  local value=$1 label=$2
+  [[ $value =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || die "$label must be a positive decimal number" 2
+  jq -en --arg value "$value" '$value | tonumber? | . != null and . > 0' >/dev/null \
+    || die "$label must be a positive decimal number" 2
+}
+
+validate_max_results() {
+  local value=$1
+  [[ $value =~ ^[0-9]+$ ]] || die "--max must be an integer from 1 to 100" 2
+  [ "$value" -ge 1 ] && [ "$value" -le 100 ] \
+    || die "--max must be an integer from 1 to 100" 2
+}
+
+apify_run() {
+  # apify_run <actor-rest-id> <actor-store-url> <input-json>
+  local actor_id=$1 actor_url=$2 input_json=$3
+  [ -n "$MAX_TOTAL_CHARGE_USD" ] \
+    || die "--max-charge is required for an Xquik Actor request" 2
+  validate_positive_number "$MAX_TOTAL_CHARGE_USD" "--max-charge"
+  local max_charge
+  max_charge=$(jq -nr --arg value "$MAX_TOTAL_CHARGE_USD" '$value | tonumber')
+
+  local plan
+  plan=$(jq -cn \
+    --arg actor "$actor_id" \
+    --arg actor_url "$actor_url" \
+    --argjson input "$input_json" \
+    --argjson max_charge "$max_charge" \
+    '{
+      source: "xquik-apify",
+      actor: $actor,
+      actor_url: $actor_url,
+      input: $input,
+      max_total_charge_usd: $max_charge
+    }')
+
+  if [ "$PLAN_ONLY" -eq 1 ]; then
+    printf '%s' "$plan" | print_json
+    return
+  fi
+  if [ "$PAID_RUN_APPROVED" -ne 1 ]; then
+    printf '%s' "$plan" | print_json
+    die "review current schema, pricing, input, and spend; then add --approve-paid-run" 2
+  fi
+
+  require_token APIFY_TOKEN
+  local endpoint max_charge_query response
+  max_charge_query=$(jq -nr --arg value "$max_charge" '$value | @uri')
+  endpoint="$APIFY_API/acts/$actor_id/run-sync-get-dataset-items?maxTotalChargeUsd=$max_charge_query"
+  response=$(printf 'header = "Authorization: Bearer %s"\n' "$APIFY_TOKEN" \
+    | curl -fsSL --config - --max-time 300 \
+      -X POST \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json" \
+      --data "$input_json" \
+      "$endpoint") \
+    || die "Xquik Actor request failed; inspect the approved run in Apify" 1
+
+  printf '%s' "$response" \
+    | jq -e --arg actor "$actor_id" --arg actor_url "$actor_url" '
+        if type != "array" then error("Actor output is not an array")
+        else {data: ., meta: {source: "xquik-apify", actor: $actor, actor_url: $actor_url}}
+        end
+      ' \
+    | print_json
 }
 
 extract_id_from_url() {
@@ -119,9 +206,9 @@ require_my_id() {
   die "X_USER_ID not set and no X_USER_OAUTH_TOKEN to look it up — set X_USER_ID in the gateway env" 2
 }
 
-# ---- Subcommands ----
+# ---- Official API subcommands ----
 
-cmd_tweet() {
+cmd_tweet_api() {
   local input=${1:-}
   [ -n "$input" ] || die "usage: x-read.sh tweet <url-or-id>"
   local id; id=$(extract_id_from_url "$input")
@@ -132,7 +219,7 @@ cmd_tweet() {
     "media.fields=$MEDIA_FIELDS"
 }
 
-cmd_tweets() {
+cmd_tweets_api() {
   local ids=${1:-}
   [ -n "$ids" ] || die "usage: x-read.sh tweets <id1,id2,...>  (max 100)"
   api_get "/tweets" \
@@ -143,11 +230,11 @@ cmd_tweets() {
     "media.fields=$MEDIA_FIELDS"
 }
 
-cmd_timeline() {
+cmd_timeline_api() {
   local who=${1:-}
   [ -n "$who" ] || die "usage: x-read.sh timeline <username-or-id>"
-  local id; id=$(resolve_user_id "$who")
   local max=${MAX_RESULTS:-10}
+  local id; id=$(resolve_user_id "$who")
   api_get "/users/$id/tweets" \
     "max_results=$max" \
     "tweet.fields=$TWEET_FIELDS" \
@@ -155,7 +242,7 @@ cmd_timeline() {
     "user.fields=$USER_FIELDS"
 }
 
-cmd_mentions() {
+cmd_mentions_api() {
   local who=${1:-}
   local id
   if [ -n "$who" ]; then id=$(resolve_user_id "$who"); else id=$(require_my_id); fi
@@ -167,7 +254,7 @@ cmd_mentions() {
     "user.fields=$USER_FIELDS"
 }
 
-cmd_bookmarks() {
+cmd_bookmarks_api() {
   local id; id=$(require_my_id)
   local max=${MAX_RESULTS:-10}
   api_get_user_oauth "/users/$id/bookmarks" \
@@ -177,7 +264,7 @@ cmd_bookmarks() {
     "user.fields=$USER_FIELDS"
 }
 
-cmd_likes() {
+cmd_likes_api() {
   local who=${1:-}
   local id
   if [ -n "$who" ]; then id=$(resolve_user_id "$who"); else id=$(require_my_id); fi
@@ -189,7 +276,7 @@ cmd_likes() {
     "user.fields=$USER_FIELDS"
 }
 
-cmd_search() {
+cmd_search_api() {
   local query=${1:-}
   [ -n "$query" ] || die "usage: x-read.sh search '<query>'  (e.g. '\"openclaw\" -is:retweet lang:en')"
   local max=${MAX_RESULTS:-10}
@@ -202,14 +289,14 @@ cmd_search() {
     "user.fields=$USER_FIELDS"
 }
 
-cmd_whois() {
+cmd_whois_api() {
   local who=${1:-}
   [ -n "$who" ] || die "usage: x-read.sh whois <username>"
   who=${who#@}
   api_get "/users/by/username/$who" "user.fields=$USER_FIELDS"
 }
 
-cmd_thread() {
+cmd_thread_api() {
   local input=${1:-}
   [ -n "$input" ] || die "usage: x-read.sh thread <url-or-id>"
   local id; id=$(extract_id_from_url "$input")
@@ -259,12 +346,182 @@ cmd_thread() {
     }'
 }
 
+# ---- Xquik Actor subcommands ----
+
+cmd_tweet_xquik() {
+  local input=${1:-}
+  [ -n "$input" ] || die "usage: x-read.sh tweet <url-or-id>"
+  local id; id=$(extract_id_from_url "$input")
+  local actor_input
+  actor_input=$(jq -cn --arg id "$id" '{
+    mode: "tweet",
+    tweetId: $id,
+    maxItems: 1,
+    outputVariant: "rich",
+    fieldStyle: "camelCase",
+    outputPreset: "nested"
+  }')
+  apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
+}
+
+cmd_tweets_xquik() {
+  local ids=${1:-}
+  [ -n "$ids" ] || die "usage: x-read.sh tweets <id1,id2,...>  (max 100)"
+  local actor_input
+  actor_input=$(jq -cn --arg ids "$ids" '
+    ($ids | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $tweet_ids
+    | if ($tweet_ids | length) < 1
+        or ($tweet_ids | length) > 100
+        or any($tweet_ids[]; test("^[0-9]+$") | not)
+      then error("tweets needs 1 to 100 comma-separated numeric IDs")
+      else {
+        mode: "tweets",
+        tweetIds: $tweet_ids,
+        maxItems: ($tweet_ids | length),
+        outputVariant: "rich",
+        fieldStyle: "camelCase",
+        outputPreset: "nested"
+      }
+      end
+  ') || die "tweets needs 1 to 100 comma-separated numeric IDs" 2
+  apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
+}
+
+cmd_timeline_xquik() {
+  local handle=${1:-}
+  [ -n "$handle" ] || die "usage: x-read.sh timeline <username>"
+  handle=${handle#@}
+  [[ $handle =~ ^[A-Za-z0-9_]{1,15}$ ]] \
+    || die "Xquik timeline needs an X handle, not a numeric user ID or URL" 2
+  local max=${MAX_RESULTS:-10}
+  local actor_input
+  actor_input=$(jq -cn --arg handle "$handle" --argjson max "$max" '{
+    mode: "profileTweets",
+    twitterHandles: [$handle],
+    maxItems: $max,
+    outputVariant: "rich",
+    fieldStyle: "camelCase",
+    outputPreset: "nested"
+  }')
+  apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
+}
+
+cmd_search_xquik() {
+  local query=${1:-}
+  [ -n "$query" ] || die "usage: x-read.sh search '<query>'"
+  local max=${MAX_RESULTS:-10}
+  local actor_input
+  actor_input=$(jq -cn --arg query "$query" --argjson max "$max" '{
+    mode: "search",
+    searchTerms: [$query],
+    maxItems: $max,
+    includeSearchTerms: true,
+    queryType: "Latest + Top",
+    outputVariant: "rich",
+    fieldStyle: "camelCase",
+    outputPreset: "nested"
+  }')
+  apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
+}
+
+cmd_thread_xquik() {
+  local input=${1:-}
+  [ -n "$input" ] || die "usage: x-read.sh thread <url-or-id>"
+  local id; id=$(extract_id_from_url "$input")
+  local max=${MAX_RESULTS:-100}
+  local actor_input
+  actor_input=$(jq -cn --arg id "$id" --argjson max "$max" '{
+    mode: "thread",
+    threadTweetIds: [$id],
+    maxItems: $max,
+    outputVariant: "rich",
+    fieldStyle: "camelCase",
+    outputPreset: "nested"
+  }')
+  apify_run "$XQUIK_TWEET_ACTOR" "$XQUIK_TWEET_URL" "$actor_input"
+}
+
+cmd_followers_xquik() {
+  local target=${1:-}
+  [ -n "$target" ] || die "usage: x-read.sh followers <username-or-id>" 2
+  case "$FOLLOWER_RELATION" in
+    followers|following|verified_followers) ;;
+    *) die "--relation must be followers, following, or verified_followers" 2 ;;
+  esac
+
+  local max=${MAX_RESULTS:-10}
+  local target_field target_value
+  if [[ $target =~ ^[0-9]+$ ]]; then
+    target_field="userIds"
+    target_value=$target
+  else
+    target_value=${target#@}
+    [[ $target_value =~ ^[A-Za-z0-9_]{1,15}$ ]] \
+      || die "followers needs an X handle or numeric user ID" 2
+    target_field="twitterHandles"
+  fi
+
+  local actor_input
+  actor_input=$(jq -cn \
+    --arg target_field "$target_field" \
+    --arg target "$target_value" \
+    --arg relation "$FOLLOWER_RELATION" \
+    --argjson max "$max" \
+    '{
+      relation: $relation,
+      maxItems: $max,
+      outputMode: "compact",
+      includeTargetMetadata: true,
+      dedupeMode: "none"
+    } + {($target_field): [$target]}')
+  apify_run "$XQUIK_FOLLOWER_ACTOR" "$XQUIK_FOLLOWER_URL" "$actor_input"
+}
+
+# ---- Source routing ----
+
+dispatch_api() {
+  local command=$1
+  shift
+  case "$command" in
+    tweet)     cmd_tweet_api "$@" ;;
+    tweets)    cmd_tweets_api "$@" ;;
+    timeline)  cmd_timeline_api "$@" ;;
+    mentions)  cmd_mentions_api "$@" ;;
+    bookmarks) cmd_bookmarks_api "$@" ;;
+    likes)     cmd_likes_api "$@" ;;
+    search)    cmd_search_api "$@" ;;
+    whois)     cmd_whois_api "$@" ;;
+    thread)    cmd_thread_api "$@" ;;
+    followers) die "followers requires --source xquik" 2 ;;
+    help|--help) usage ;;
+    *) die "unknown subcommand: $command  (try --help)" ;;
+  esac
+}
+
+dispatch_xquik() {
+  local command=$1
+  shift
+  case "$command" in
+    tweet)     cmd_tweet_xquik "$@" ;;
+    tweets)    cmd_tweets_xquik "$@" ;;
+    timeline)  cmd_timeline_xquik "$@" ;;
+    search)    cmd_search_xquik "$@" ;;
+    thread)    cmd_thread_xquik "$@" ;;
+    followers) cmd_followers_xquik "$@" ;;
+    mentions|bookmarks|likes|whois)
+      die "$command is available only through the official API source" 2
+      ;;
+    help|--help) usage ;;
+    *) die "unknown subcommand: $command  (try --help)" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
-x-read — read-only X (Twitter) v2 API client.
+x-read - read-only X data client.
 
 Usage:
-  x-read.sh [--pretty] [--max N] <subcommand> [args]
+  x-read.sh [flags] <subcommand> [args]
 
 Subcommands:
   tweet <url-or-id>          Read a single tweet
@@ -276,15 +533,24 @@ Subcommands:
   search '<query>'           Recent search (last 7 days)
   whois <username>           Resolve username to user object + id
   thread <url-or-id>         Reconstruct a thread by conversation_id
+  followers <user>           Read followers, following, or verified followers
 
 Flags:
-  --pretty   Indented JSON
-  --max N    max_results for list endpoints (default 10, cap 100)
+  --source api|xquik       Data source (default: api)
+  --pretty                 Indented JSON
+  --max N                  Result cap (default 10, range 1 to 100)
+  --relation RELATION      followers, following, or verified_followers
+  --max-charge USD         Required Apify maximum total charge
+  --plan                   Print an Xquik Actor plan without running it
+  --approve-paid-run       Approve the exact displayed paid Actor request
 
 Env:
   X_BEARER_TOKEN          required for public reads
   X_USER_OAUTH_TOKEN      required for bookmarks (and private likes)
   X_USER_ID               optional convenience for "my" reads
+  APIFY_TOKEN             required only for an approved Xquik Actor run
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
 EOF
 }
 
@@ -295,30 +561,71 @@ main() {
   local args=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --pretty)   PRETTY=1; shift ;;
-      --max)      MAX_RESULTS=$2; shift 2 ;;
-      -h|--help)  usage; exit 0 ;;
-      *)          args+=("$1"); shift ;;
+      --pretty)
+        PRETTY=1
+        shift
+        ;;
+      --max)
+        [ -n "${2:-}" ] || die "--max needs a value" 2
+        MAX_RESULTS=$2
+        shift 2
+        ;;
+      --source)
+        [ -n "${2:-}" ] || die "--source needs api or xquik" 2
+        SOURCE=$2
+        shift 2
+        ;;
+      --relation)
+        [ -n "${2:-}" ] || die "--relation needs a value" 2
+        FOLLOWER_RELATION=$2
+        shift 2
+        ;;
+      --max-charge)
+        [ -n "${2:-}" ] || die "--max-charge needs a USD value" 2
+        MAX_TOTAL_CHARGE_USD=$2
+        shift 2
+        ;;
+      --plan)
+        PLAN_ONLY=1
+        shift
+        ;;
+      --approve-paid-run)
+        PAID_RUN_APPROVED=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
     esac
   done
   set -- "${args[@]}"
+
+  case "$SOURCE" in
+    api|xquik) ;;
+    *) die "--source must be api or xquik" 2 ;;
+  esac
+  if [ "$SOURCE" = "api" ] \
+    && { [ "$PLAN_ONLY" -eq 1 ] \
+      || [ "$PAID_RUN_APPROVED" -eq 1 ] \
+      || [ -n "$MAX_TOTAL_CHARGE_USD" ]; }; then
+    die "--plan, --approve-paid-run, and --max-charge require --source xquik" 2
+  fi
+  if [ -n "$MAX_RESULTS" ]; then
+    validate_max_results "$MAX_RESULTS"
+  fi
 
   local sub=${1:-}
   [ -n "$sub" ] || { usage; exit 1; }
   shift
 
-  case "$sub" in
-    tweet)     cmd_tweet "$@" ;;
-    tweets)    cmd_tweets "$@" ;;
-    timeline)  cmd_timeline "$@" ;;
-    mentions)  cmd_mentions "$@" ;;
-    bookmarks) cmd_bookmarks "$@" ;;
-    likes)     cmd_likes "$@" ;;
-    search)    cmd_search "$@" ;;
-    whois)     cmd_whois "$@" ;;
-    thread)    cmd_thread "$@" ;;
-    help|--help) usage ;;
-    *) die "unknown subcommand: $sub  (try --help)" ;;
+  case "$SOURCE" in
+    api) dispatch_api "$sub" "$@" ;;
+    xquik) dispatch_xquik "$sub" "$@" ;;
   esac
 }
 
