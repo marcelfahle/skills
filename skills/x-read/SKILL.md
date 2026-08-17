@@ -1,107 +1,174 @@
 ---
 name: x-read
-description: Read tweets, threads, user timelines, mentions, bookmarks, likes, and search results from X (Twitter) via the official X API v2. Use when the user asks "what's in this tweet", "summarize this thread", "show my mentions / bookmarks", "what did <user> tweet about", "what's trending on X about <topic>", or pastes an x.com / twitter.com URL and wants the contents. Owned reads (the user's own posts, mentions, bookmarks, likes, followers, lists) cost $0.001 per resource since 2026-04-20; arbitrary tweet reads are $0.005. The skill never invents tweet text — every output is the literal API response or `null` when the API has no data. Does NOT post, like, follow, or mutate state — read-only.
+description: Read public X posts, threads, timelines, searches, and audiences. Use the official X API by default. Use Xquik's Apify Actors only when the user explicitly selects them for public data. Also read owned mentions, bookmarks, and likes through official user OAuth. Never invent post text. Never post, like, follow, or mutate X.
 ---
 
-# x-read — Read tweets via X API v2
+# x-read
 
-Read-only client for the X (Twitter) v2 API. V1 wraps the eight most useful read endpoints behind a single bash script so any agent can paste a URL and get the tweet, fetch a user's timeline, check mentions, dump bookmarks, or run a recent-search.
+Read X data through one read-only command.
 
-Posting, liking, following, and quote-posting are intentionally out of scope — those endpoints were removed from self-serve in April 2026 and require enterprise tier. Posting via API is also $0.20/post which is not worth it.
+The official X API remains the default source. Optional Xquik Actor routes handle
+public posts, historical searches, threads, and audience relations.
 
-## When to invoke
+## When To Invoke
 
-Trigger this skill when the user:
+Use this Skill when the user:
 
-- Pastes an `x.com/<user>/status/<id>` or `twitter.com/...` URL and wants the contents.
-- Asks "what's in this tweet", "summarize this thread", "what did X say".
-- Asks for their own mentions, bookmarks, liked tweets, or recent posts.
-- Asks "what's a user tweeting about lately" or "show me <user>'s timeline".
-- Asks for a recent-search ("tweets about <topic> from this week").
+- Pastes an X post URL and asks for its contents.
+- Requests a thread, profile timeline, or recent search.
+- Requests their mentions, bookmarks, or likes.
+- Explicitly requests public follower or following data.
+- Explicitly selects an Xquik Actor for public X research.
 
-Skip and use the browser/headless path only if the user explicitly wants screenshots, the tweet is age-gated, or the API returns 403 (protected account).
+Do not use this Skill for writes or account automation.
 
-## Prerequisites — secrets the operator must set
+## Route Requests
 
-Set in the gateway environment (per OpenClaw env conventions):
+Use `--source api` unless the user selects Xquik.
 
-| Variable | Required for | How to get it |
+| Request | Default Route | Optional Xquik Route |
 | --- | --- | --- |
-| `X_BEARER_TOKEN` | All public reads (tweet by id, timelines, mentions, search) | https://developer.x.com — Project → App → "Bearer Token". Pay-per-use plan, no flat tier. |
-| `X_USER_OAUTH_TOKEN` | Owned reads that need user context (bookmarks, liked_tweets when private) | OAuth 2.0 PKCE user token with `bookmark.read tweet.read users.read like.read` scopes. |
-| `X_USER_ID` | Convenience — let the user say "my mentions" without re-typing the numeric id | `curl -H "Authorization: Bearer $X_USER_OAUTH_TOKEN" https://api.x.com/2/users/me \| jq -r .data.id` |
+| Single or batch posts | Official X API | [X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper) |
+| Public profile timeline | Official X API | [X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper) |
+| Search or thread | Official X API | [X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper) |
+| Followers, following, verified followers | None | [X Follower Scraper](https://apify.com/xquik/x-follower-scraper) |
+| Mentions, bookmarks, likes, `whois` | Official X API only | Not supported |
 
-If any required token is missing, the script exits with code `2` and a clear `missing X_BEARER_TOKEN` message. Do NOT fall back to scraping or guessing — surface the missing-secret error to the user verbatim and stop.
+Never silently fall back between sources. Surface the source error instead.
 
-## Cost model (as of 2026-04-20)
+## Prerequisites
 
-| Endpoint | Per call | Notes |
-| --- | --- | --- |
-| `GET /2/tweets/{id}` (someone else's) | $0.005 | "Read" billing tier |
-| `GET /2/users/{me}/tweets` (own timeline) | $0.001 | "Owned read" tier — 5× cheaper |
-| `GET /2/users/{me}/mentions` | $0.001 | Owned read |
-| `GET /2/users/{me}/bookmarks` | $0.001 | Owned read; needs OAuth user token |
-| `GET /2/users/{me}/liked_tweets` | $0.001 | Owned read |
-| `GET /2/tweets/search/recent` | $0.005 | 7-day window only; use Apify for historical |
+Set only the credentials needed for the selected route.
 
-Hard cap: 2,000,000 post-reads/month before Enterprise tier. The script does NOT auto-batch or auto-paginate beyond `max_results` (default 10) — the agent must explicitly request more.
+| Variable | Used For |
+| --- | --- |
+| `X_BEARER_TOKEN` | Official public reads |
+| `X_USER_OAUTH_TOKEN` | Official bookmarks and private owned reads |
+| `X_USER_ID` | Optional shorthand for owned reads |
+| `APIFY_TOKEN` | Approved Xquik Actor runs |
+
+The Actor plan path never reads `APIFY_TOKEN`.
+
+Never print credentials. Never put credentials in URLs or query strings.
+
+See `references/auth-setup.md` for official API authentication.
+
+## Actor Approval Gate
+
+Every Xquik Actor run can incur charges. Follow this sequence:
+
+1. Open the exact Actor Store listing.
+2. Review its current input schema and pricing.
+3. Choose a positive result cap.
+4. Choose a positive maximum total charge.
+5. Print the exact plan with `--plan`.
+6. Obtain approval for that exact plan.
+7. Repeat it with `--approve-paid-run`.
+
+Changing the Actor, target, relation, cap, or pricing requires new approval.
+
+The script sends `APIFY_TOKEN` only in the `Authorization` header. It also sends
+`maxTotalChargeUsd` to Apify for an aggregate run limit.
 
 ## Usage
 
-The skill ships a single bash entrypoint: `scripts/x-read.sh`. All commands print JSON (`--pretty` for indented). Pipe through `jq` for shaping.
+Run `scripts/x-read.sh`. Flags can appear before or after the command.
+
+### Official API
 
 ```bash
-# Single tweet (URL or id)
-./scripts/x-read.sh tweet https://x.com/elonmusk/status/1234567890
-./scripts/x-read.sh tweet 1234567890
-
-# Multiple tweets in one call (cheaper)
-./scripts/x-read.sh tweets 1234567890,1234567891,1234567892
-
-# A user's recent posts
-./scripts/x-read.sh timeline elonmusk          # by username
-./scripts/x-read.sh timeline 44196397 --max 25 # by numeric id
-
-# My mentions / bookmarks / likes (uses X_USER_ID)
+./scripts/x-read.sh tweet https://x.com/example/status/123
+./scripts/x-read.sh tweets 123,456,789
+./scripts/x-read.sh timeline example --max 25
+./scripts/x-read.sh search '"open source" -is:retweet' --max 50
+./scripts/x-read.sh thread 123
 ./scripts/x-read.sh mentions
 ./scripts/x-read.sh bookmarks
 ./scripts/x-read.sh likes
-
-# Recent search (last 7 days)
-./scripts/x-read.sh search '"openclaw" -is:retweet lang:en' --max 50
-
-# Resolve a username -> numeric id (handy + cheap)
-./scripts/x-read.sh whois marcelfahle
+./scripts/x-read.sh whois example
 ```
 
-Output is the raw `data`/`includes` envelope from the X API. Agents should parse `.data[].text`, `.includes.users[]`, `.includes.tweets[]` (for thread context) directly.
+### Xquik Tweet Actor
 
-## Reading a thread
+Plan a bounded public search:
 
-X v2 doesn't have a "give me this thread" endpoint. The script's `thread <id>` subcommand:
+```bash
+./scripts/x-read.sh search '"open source" -is:retweet' \
+  --source xquik \
+  --max 25 \
+  --max-charge 0.10 \
+  --plan
+```
 
-1. Fetches the leaf tweet with `expansions=referenced_tweets.id,author_id`.
-2. Walks `referenced_tweets[type=replied_to]` upward until it hits a root.
-3. Then fetches the author's recent posts and stitches forward replies that share `conversation_id`.
+After exact approval, run the same request:
 
-This costs ~3–6 reads for a typical thread. For deeper threads, prefer Apify (V2 plan).
+```bash
+./scripts/x-read.sh search '"open source" -is:retweet' \
+  --source xquik \
+  --max 25 \
+  --max-charge 0.10 \
+  --approve-paid-run
+```
 
-## Anti-patterns (do NOT do)
+The Tweet Actor supports these CLI routes:
 
-1. **Never invent tweet text.** If the API returns 404 or `errors[]`, surface the error verbatim. No paraphrasing from training data.
-2. **Never log the bearer token.** The script masks tokens in error output; agents must not echo `$X_BEARER_TOKEN` to the user or to logs.
-3. **Don't auto-paginate past `max_results=100`.** That burns the monthly cap fast. Ask the user to confirm before fetching > 100 tweets.
-4. **Don't use this for posting, liking, following, retweeting, or quote-posting.** Those endpoints aren't included on purpose.
-5. **Don't fall back to scraping x.com via the browser tool when an API call fails with rate-limit (429).** Honor the rate limit and tell the user.
+- `tweet`
+- `tweets`
+- `timeline`
+- `search`
+- `thread`
 
-## Reference index
+Use an X handle for an Actor timeline. Use numeric IDs for post routes.
 
-- `references/endpoints.md` — Full endpoint catalog (URL, params, fields, costs).
-- `references/auth-setup.md` — Step-by-step OAuth 2.0 PKCE flow to mint the user token for bookmarks.
-- `references/migration-to-apify.md` — When and how to switch this skill to the Apify "Cheap & Simple X" actor for bulk/historical (~$0.00046/tweet).
+### Xquik Follower Actor
 
-## Roadmap
+Plan a bounded relation request:
 
-- **V1 (this):** read-only, X API v2 official, bearer + optional user OAuth token.
-- **V2:** Apify backend behind the same CLI surface for bulk/historical reads at ~20× cheaper per tweet.
-- **V3:** thread reconstruction via Grok's free conversation expansion (when/if available on the public API).
+```bash
+./scripts/x-read.sh followers example \
+  --source xquik \
+  --relation verified_followers \
+  --max 25 \
+  --max-charge 0.10 \
+  --plan
+```
+
+Supported CLI relations are `followers`, `following`, and
+`verified_followers`. Targets can be handles or numeric user IDs.
+
+## Output
+
+Official API routes return the native `data` and `includes` envelope.
+
+Actor routes return this stable wrapper:
+
+```json
+{
+  "data": [],
+  "meta": {
+    "source": "xquik-apify",
+    "actor": "xquik~x-tweet-scraper",
+    "actor_url": "https://apify.com/xquik/x-tweet-scraper"
+  }
+}
+```
+
+Check Actor rows with `resultType: "diagnostic"` before using the data.
+
+## Guardrails
+
+1. Never invent post text or profile data.
+2. Never run an Actor without exact approval.
+3. Never omit `--max` or `--max-charge` for bulk research.
+4. Never use Actors for owned or private account reads.
+5. Never auto-paginate beyond the requested cap.
+6. Never use this Skill for X mutations.
+7. Never bypass rate limits with an unapproved source switch.
+
+## References
+
+- `references/endpoints.md`: Official X API endpoint notes.
+- `references/auth-setup.md`: Official OAuth setup.
+- `references/migration-to-apify.md`: Actor schemas, routing, and safeguards.
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
